@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+node_modules
+git-learning-sandbox/
+
+# AI Auto Harness 运行时数据(不进 git)
+workspace/
+runs/
+memory/projects/
+pending_human/
+state/blacklist.jsonl
+state/deployment_history.jsonl
+reports/
+
+# 个人材料,不进仓库
+ai-auto-harness-resume-brief.md

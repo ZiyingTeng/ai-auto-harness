@@ -1,0 +1,281 @@
+---
+name: install-env
+description: venv + pip + torch sm_12 检测/修复 + 常见 build issue 处理
+allowed-tools: [Read, Write, Edit, Bash, Grep]
+agent: install-agent
+---
+
+# install-env
+
+## 🔴 硬规则(必须遵守)
+
+### 前置:fetch 必须完全 done 才能进 install(R5 串行带宽)
+
+启动 install 前,**必须** 校验 `$WORKSPACE/state.json`:
+
+```bash
+PHASE=$(jq -r .phase "$WORKSPACE/state.json")
+STATUS=$(jq -r .status "$WORKSPACE/state.json")
+PHASES_DONE=$(jq -r '.phases_done // [] | .[]' "$WORKSPACE/state.json")
+
+if ! echo "$PHASES_DONE" | grep -q "fetch-weights"; then
+    echo "ERROR: fetch-weights 未完成,不能进 install-env (R5: 带宽串行)" >> "$LOG"
+    exit 1
+fi
+```
+
+**禁止** 在 fetch-weights 还在 background 跑时启动 pip install(2GB CUDA wheels 与 28GB 权重抢同一根管道,两边都慢一倍)。
+
+### 禁止 `--no-cache-dir`
+
+`launch_worker.sh` 已 env-level 把 `PIP_CACHE_DIR=$LOG_DIR/.cache/pip` 隔离,**已经不污染系统 cache**。再加 `--no-cache-dir` 反而每次都重下 wheel,慢 + 浪费带宽 + 抢 fetch 带宽。
+
+```bash
+# ❌ pip install torch --no-cache-dir
+# ✅ pip install torch  # PIP_CACHE_DIR 已隔离,放心用 cache
+```
+
+### 串行 pip(禁止并行)
+
+**Never run multiple pip installs for the same venv in parallel.**
+
+错误做法:
+```bash
+pip install torch &
+pip install transformers &
+wait
+# 同一 venv 并行写,site-packages 元数据损坏,某些包看似装上但 import 失败
+```
+
+正确做法:
+```bash
+pip install torch 2>&1 | tee -a "$LOG"          # 等完成
+pip install transformers 2>&1 | tee -a "$LOG"   # 再下一个
+pip install -r requirements.txt 2>&1 | tee -a "$LOG"
+```
+
+每个 pip 命令必须 **foreground + tee + 等完成**,再发下一个.
+
+### GPU pre-flight(装完 torch 必做)
+
+装完 torch 之后,**真用 GPU 前必须 verify**:
+
+```bash
+python -c "
+import torch
+print('cuda_available:', torch.cuda.is_available())
+print('device_count:', torch.cuda.device_count())
+print('capability:', torch.cuda.get_device_capability())
+print('archs:', torch.cuda.get_arch_list())
+" 2>&1 | tee -a "$LOG"
+```
+
+异常情况 → 第 4 步 sm_12 修复.若 `cuda_available=False` 就装错了,**绝不要**继续到 run-and-repair 让它在 CPU 上跑(GPU 利用率 0% verify 会 fail).
+
+## 落盘约定(必读)
+
+- **日志**:`$WORKSPACE/logs/install_env.log` — venv 创建 + pip install + sm_12 检测 + 修复尝试 全输出
+- **结果**:`$WORKSPACE/results/install.json` — return schema
+- **环境快照**:`$WORKSPACE/results/environment.json` — torch / cuda / python / sm_arch / venv 路径(便于后续诊断)
+
+```bash
+mkdir -p "$WORKSPACE/logs" "$WORKSPACE/results"
+LOG="$WORKSPACE/logs/install_env.log"
+echo "==== install-env start at $(date -Iseconds) ====" >> "$LOG"
+echo "=== PHASE_START phase=install-env slug=$SLUG run_id=$RUN_ID ts=$(date -Iseconds) ==="
+
+# 所有 bash 命令都用这个模式: cmd 2>&1 | tee -a "$LOG"
+```
+
+## 你的输入(主 agent 传入)
+
+```json
+{
+  "slug": "<project-slug>",
+  "workspace_path": "/root/ai-auto-harness/workspace/<slug>",
+  "entry_script": "python -m flux t2i ...",
+  "requirements_files": ["requirements.txt", "..."]
+}
+```
+
+## 启动前先读 lessons(关键)
+
+```bash
+ls memory/lessons/
+cat memory/lessons/torch-sm12.md       # 装 torch 必读
+cat memory/lessons/flash-attn-build.md # 项目用 flash-attn 时读
+cat memory/projects/<slug>.md          # 若该项目之前装过有经验
+```
+
+## 工作流
+
+### 第 1 步:创建 venv
+
+```bash
+cd "$WORKSPACE"
+python -m venv venv 2>&1 | tee -a "$LOG"
+source venv/bin/activate
+which python 2>&1 | tee -a "$LOG"  # 验证指向 workspace/<slug>/venv/bin/python
+```
+
+### 第 2 步:升级核心工具
+
+```bash
+pip install --upgrade pip setuptools wheel 2>&1 | tee -a "$LOG"
+```
+
+### 第 3 步:装项目依赖
+
+**pip 长任务必须后台 + 短 poll**(R4 防 sleep loop):
+
+```bash
+# 错:pip install -e . 2>&1 | tee -a "$LOG"  — 占住 foreground,LLM 只能 sleep 等
+# 对:后台跑,LLM 下个 turn tail 判活,绝不连续 sleep
+setsid nohup bash -c "pip install -e . 2>&1; echo PIP_EXIT=\$? >> '$LOG'" >> "$LOG" 2>&1 &
+PIP_PID=$!
+echo $PIP_PID > "$WORKSPACE/.cache/install_pip.pid"
+```
+
+后续 turn 用 `tail -50 $LOG` + `kill -0 $PIP_PID && echo alive` 判活,**禁止连续 sleep**(R4.2)。8 turn 没装完 → `paused_in_progress` return,主 agent 下次接续(R4.5)。
+
+优先级(**注意:每次只跑一个 pip 命令,foreground + tee,等完成再下一个**):
+
+```bash
+cd "$WORKSPACE/repo"
+
+# (a) 如果有 setup.py 或 pyproject.toml
+if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
+    pip install -e . 2>&1 | tee -a "$LOG"
+# (b) 否则 requirements.txt
+elif [ -f "requirements.txt" ]; then
+    pip install -r requirements.txt 2>&1 | tee -a "$LOG"
+# (c) 否则看 README quickstart
+else
+    grep -A 5 "pip install" README.md | tee -a "$LOG"
+    # 手抄出来执行,**一条一条来**,每条 2>&1 | tee -a "$LOG"
+fi
+```
+
+**禁止**:`pip install A &; pip install B &; wait`(并行写同一 venv 损坏 site-packages)
+**禁止**:把 pip 放 background(`run_in_background=true`)— pip 必须 foreground
+
+记录用的方案 + 任何失败到 `runs/$RUN_ID/decisions.md`.
+
+### 第 4 步:torch sm_12 检测(5090 必做)
+
+```bash
+python -c "import torch; archs = torch.cuda.get_arch_list(); print('archs:', archs); ok = any('120' in a or '12.0' in a for a in archs); print('sm_12_ok:', ok); exit(0 if ok else 1)" 2>&1 | tee -a "$LOG"
+```
+
+**不通过**:
+1. 读 `memory/lessons/torch-sm12.md` 的方案 A
+2. 卸载现 torch:`pip uninstall -y torch torchvision torchaudio`
+3. 装 nightly cu124(方案 A):
+   ```bash
+   pip install --index-url https://download.pytorch.org/whl/nightly/cu124 \
+       torch torchvision torchaudio
+   ```
+4. 重新验证 sm_12 是否在 list
+
+最多 3 次重装尝试,仍不行 → `blocked.append("torch_sm12_unavailable")` 调 request-human-intervention.
+
+### 第 5 步:常见 build issue 修复(read lessons + 应用)
+
+逐个 stderr 排查常见模式:
+
+- **flash-attn 装失败** → 看 `memory/lessons/flash-attn-build.md`,试 prebuilt wheel(方案 A)
+- **bitsandbytes 不兼容** → 版本回退到匹配 torch 的(`pip install bitsandbytes==X.Y`)
+- **缺 nvcc** → 不要 sudo apt 装,改:
+  - 看是否项目真的需要 nvcc(只是编译时需要,推理时不一定)
+  - 如不是必须,跳过该 dep
+- **deepspeed / xformers 编译失败** → 同 flash-attn 思路找 prebuilt
+- **typing-extensions 冲突** → `pip install --upgrade typing-extensions`
+
+### 第 6 步:验证 entry_script 至少能 import
+
+```bash
+cd "$WORKSPACE/repo"
+python -c "<from entry_script 推断的顶层 import,比如 import flux 或 from songgen import generate>" 2>&1 | head -20
+```
+
+失败 → 看 stderr 缺什么 module → pip install 补 → 重试
+
+### 第 7 步:写经验(lesson 写入机制)
+
+修复成功后,**判断 3 问**(同 run-and-repair):
+
+| 问题 | yes → 写哪里 |
+|---|---|
+| 修复是这个项目特有的(项目 own 的依赖 pin / 配置)? | `memory/projects/<slug>.md` 追加 |
+| 修复方法任何 5090 项目都可能用上? | `memory/lessons/<topic>.md` 追加段落(append,不覆盖) |
+| 都不是(只是版本微调)? | **不写**(noise) |
+
+**项目专属经验例子**(写 projects/):
+
+```markdown
+# <slug> install 经验
+
+- 用 nightly cu124 torch(项目 requirements pin torch==2.5,与默认 stable 不兼容)
+- flash-attn 装的 2.7.4 prebuilt wheel(cu124 + torch 2.7 + abiFALSE + cp310)
+- bitsandbytes 退到 0.43.x(与 torch 2.7 兼容)
+- 项目自带 install.sh 用法:`bash install.sh --skip-flash-attn`
+```
+
+**通用经验例子**(写 lessons/):
+
+- 5090 sm_12 → 改 `memory/lessons/torch-sm12.md`(若有新方案)
+- 某新 build 工具失败的修复套路 → 新建 `memory/lessons/<topic>.md`
+
+**已有 lesson append 格式**:看 `memory/lessons/torch-sm12.md` 末尾追加新章节,不要重写整个文件.
+
+### 第 8 步:return 前落盘 results JSON + environment.json
+
+```bash
+# 环境快照 — 给 verify 和后续诊断用
+cat > "$WORKSPACE/results/environment.json" <<JSON
+{
+  "venv_path": "$WORKSPACE/venv",
+  "python": "$(python --version 2>&1)",
+  "pip": "$(pip --version 2>&1)",
+  "torch": "$(python -c 'import torch; print(torch.__version__)' 2>&1)",
+  "cuda": "$(python -c 'import torch; print(torch.version.cuda)' 2>&1)",
+  "torch_archs": $(python -c 'import torch,json; print(json.dumps(torch.cuda.get_arch_list()))' 2>&1),
+  "sm_12_supported": $(python -c 'import torch; print("true" if any("120" in a or "12.0" in a for a in torch.cuda.get_arch_list()) else "false")' 2>&1),
+  "captured_at": "$(date -Iseconds)"
+}
+JSON
+
+# install 结果
+cat > "$WORKSPACE/results/install.json" <<JSON
+{
+  "venv_path": "$WORKSPACE/venv",
+  "deps_ok": <true|false>,
+  "fixes_applied": [...],
+  "warnings": [...],
+  "blocked": <true|false>,
+  "completed_at": "$(date -Iseconds)"
+}
+JSON
+
+echo "==== install-env end at $(date -Iseconds) ====" >> "$LOG"
+echo "=== PHASE_END   phase=install-env slug=$SLUG status=done ts=$(date -Iseconds) ==="
+```
+
+## 返回 schema
+
+```json
+{
+  "venv_path": "/root/ai-auto-harness/workspace/<slug>/venv",
+  "deps_ok": true,
+  "fixes_applied": ["torch_nightly_cu124", "flash_attn_prebuilt_wheel"],
+  "warnings": ["bitsandbytes 退到 0.43.x"],
+  "blocked": false
+}
+```
+
+## 反模式
+
+- ❌ `sudo pip install` / `pip install --user`(打破隔离)
+- ❌ 卸载系统级 python / 改 ~/.bashrc 改 PATH
+- ❌ 强装某个特定版本而没看 lessons(浪费时间)
+- ❌ 第 4 次重装 torch 还没好 → 必须 raise pending_human
